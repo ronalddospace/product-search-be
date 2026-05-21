@@ -7,3 +7,4 @@ Pillow==10.4.0
 numpy==1.26.4
 pycocotools==2.0.8
 pydantic==2.9.0
+google-genai>=1.0.0

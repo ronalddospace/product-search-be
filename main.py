@@ -24,8 +24,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import json
 import logging
 import os
+import re
+import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -95,6 +98,114 @@ DEFAULT_PROMPTS = [
 LENS_COUNTRY = os.environ.get("LENS_COUNTRY", "us")
 LENS_LANGUAGE = os.environ.get("LENS_LANGUAGE", "en")
 LENS_MAX_PARALLEL = int(os.environ.get("LENS_MAX_PARALLEL", "6"))
+
+# Gemini — vision LLM that emits SAM3-ready prompts by looking at the room.
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Gemini client (lazy, thread-safe)
+# ─────────────────────────────────────────────────────────────────────
+
+_gemini_client = None
+_gemini_client_lock = threading.Lock()
+
+
+def _gemini_get_client():
+    """Lazy thread-safe ``google.genai`` client."""
+    global _gemini_client
+    if _gemini_client is None:
+        with _gemini_client_lock:
+            if _gemini_client is None:
+                if not GOOGLE_API_KEY:
+                    raise RuntimeError("GOOGLE_API_KEY missing in .env")
+                from google import genai
+
+                _gemini_client = genai.Client(api_key=GOOGLE_API_KEY)
+    return _gemini_client
+
+
+# Instruction we send to Gemini. The output format is constrained to a JSON
+# array of 3-4 word SAM3 prompts — colour first because SAM3 matches colour
+# most reliably, then material/shape, then category.
+DISCOVERY_INSTRUCTION = """\
+You are looking at a photo of a room. List every distinct piece of furniture
+and decor visible.
+
+For each item, output a SAM3-ready segmentation prompt with 3-4 words
+formatted as:  <colour> <material-or-texture> <category>
+
+Examples of valid prompts:
+  "gray linen sofa"
+  "round oak coffee table"
+  "tall brass floor lamp"
+  "blue patterned wool rug"
+  "framed abstract artwork"
+  "green potted plant"
+
+Rules:
+  - Colour FIRST — SAM3 matches colour most reliably.
+  - 3-4 words total per prompt. No more, no less.
+  - Skip walls, floor, and ceiling — handled separately.
+  - Skip tiny clutter (books, glasses, throw pillows on a sofa).
+  - If two similar items are visible (e.g. two matching chairs), list once.
+  - Return ONLY a JSON array of strings. No prose, no markdown fences.
+
+Example output:
+["gray linen sofa", "round oak coffee table", "tall brass floor lamp"]
+"""
+
+
+def _parse_prompt_list(text: str) -> List[str]:
+    """Pull a JSON array of strings out of Gemini's reply, tolerantly."""
+    text = (text or "").strip()
+    # Strip markdown code fences if Gemini added them.
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+    text = text.strip()
+    try:
+        data = json.loads(text)
+    except Exception:
+        match = re.search(r"\[.*\]", text, re.DOTALL)
+        if not match:
+            return []
+        try:
+            data = json.loads(match.group(0))
+        except Exception:
+            return []
+    if not isinstance(data, list):
+        return []
+    return [str(p).strip() for p in data if isinstance(p, str) and p.strip()]
+
+
+def discover_sam3_prompts(room_image: Image.Image) -> List[str]:
+    """Ask Gemini Flash Lite to enumerate visible objects as SAM3 prompts.
+
+    Returns a list of 3-4 word prompts ordered by visual prominence. Returns
+    an empty list if Gemini cannot produce a usable response (caller falls
+    back to ``DEFAULT_PROMPTS``).
+    """
+    from google.genai import types
+
+    client = _gemini_get_client()
+    contents = [room_image, DISCOVERY_INSTRUCTION]
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            response_modalities=["TEXT"],
+            temperature=0.0,
+        ),
+    )
+    candidates = getattr(response, "candidates", None) or []
+    if not candidates:
+        return []
+    parts = candidates[0].content.parts if candidates[0].content else []
+    text = "\n".join(p.text for p in parts if getattr(p, "text", None))
+    return _parse_prompt_list(text)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -309,16 +420,50 @@ class ProcessRequest(BaseModel):
     """JSON body for POST /api/process."""
 
     image_url: str
-    prompts: Optional[List[str]] = None  # override DEFAULT_PROMPTS if you want
+    # Optional override. When set, skips the Gemini discovery step.
+    prompts: Optional[List[str]] = None
 
 
-def process_pipeline(image_url: str, prompts: List[str]) -> Dict[str, Any]:
-    """Run the full segment → upload → lens → filter pipeline."""
+def process_pipeline(
+    image_url: str, override_prompts: Optional[List[str]] = None
+) -> Dict[str, Any]:
+    """Run the full discovery → segment → upload → lens → filter pipeline."""
     logger.info(f"Downloading room: {image_url}")
     room_img = download_image(image_url)
     w, h = room_img.size
-    image_b64 = encode_jpeg_b64(room_img)
 
+    # Step 0: Gemini Flash Lite enumerates visible objects as SAM3 prompts.
+    # If the caller forced a prompt list we use that as-is. Otherwise we ask
+    # Gemini; on any failure we fall back to the hardcoded DEFAULT_PROMPTS so
+    # the pipeline still runs.
+    prompts: List[str]
+    prompt_source: str
+    if override_prompts:
+        prompts = override_prompts
+        prompt_source = "caller"
+        logger.info(f"Using {len(prompts)} caller-supplied prompts")
+    else:
+        try:
+            discovered = discover_sam3_prompts(room_img)
+            if discovered:
+                prompts = discovered
+                prompt_source = "gemini"
+                logger.info(
+                    f"Gemini ({GEMINI_MODEL}) discovered {len(prompts)} prompts: "
+                    f"{prompts}"
+                )
+            else:
+                prompts = DEFAULT_PROMPTS
+                prompt_source = "default-empty-discovery"
+                logger.warning(
+                    "Gemini returned no usable prompts — using DEFAULT_PROMPTS"
+                )
+        except Exception as e:
+            prompts = DEFAULT_PROMPTS
+            prompt_source = "default-error"
+            logger.warning(f"Gemini discovery failed ({e}) — using DEFAULT_PROMPTS")
+
+    image_b64 = encode_jpeg_b64(room_img)
     logger.info(f"SAM3: {len(prompts)} prompts")
     prompt_results = call_sam3(image_b64, prompts)
 
@@ -369,6 +514,8 @@ def process_pipeline(image_url: str, prompts: List[str]) -> Dict[str, Any]:
 
     summary = {
         "image_url": image_url,
+        "prompt_source": prompt_source,  # "gemini" | "caller" | "default-*"
+        "prompts_used": prompts,
         "objects_detected": len(objects),
         "total_purchasable_candidates": sum(len(o["candidates"]) for o in objects),
     }
@@ -399,10 +546,11 @@ app.add_middleware(
 
 @app.post("/api/process")
 async def process_endpoint(body: ProcessRequest) -> Dict[str, Any]:
-    """Run the segment → upload → lens → filter pipeline for one room URL."""
-    prompts = body.prompts or DEFAULT_PROMPTS
+    """Run the discovery → segment → upload → lens → filter pipeline."""
     try:
-        return await asyncio.to_thread(process_pipeline, body.image_url, prompts)
+        return await asyncio.to_thread(
+            process_pipeline, body.image_url, body.prompts
+        )
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except requests.HTTPError as e:
@@ -421,7 +569,9 @@ def health() -> Dict[str, str]:
         "status": "ok",
         "roboflow_key": "set" if ROBOFLOW_API_KEY else "missing",
         "search_api_key": "set" if SEARCH_API_KEY else "missing",
+        "google_api_key": "set" if GOOGLE_API_KEY else "missing",
         "r2": "set" if R2_BUCKET_NAME and R2_PUBLIC_URL else "missing",
+        "gemini_model": GEMINI_MODEL,
     }
 
 
