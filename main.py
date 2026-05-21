@@ -38,7 +38,7 @@ import boto3
 import numpy as np
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
@@ -241,6 +241,29 @@ def upload_png_to_r2(png_bytes: bytes, key: str) -> str:
     return f"{R2_PUBLIC_URL}/{key}"
 
 
+def upload_room_to_r2(image_bytes: bytes, filename: str) -> str:
+    """Upload the user-uploaded room image to R2 and return its public URL."""
+    ext = os.path.splitext(filename or "")[1].lower()
+    if ext not in (".jpg", ".jpeg", ".png", ".webp"):
+        ext = ".jpg"
+    content_type = {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+    }[ext]
+    key = f"test-project/rooms/{uuid.uuid4().hex}{ext}"
+    client = _r2_client()
+    client.put_object(
+        Bucket=R2_BUCKET_NAME,
+        Key=key,
+        Body=image_bytes,
+        ContentType=content_type,
+        CacheControl="public, max-age=3600",
+    )
+    return f"{R2_PUBLIC_URL}/{key}"
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Image helpers
 # ─────────────────────────────────────────────────────────────────────
@@ -294,6 +317,15 @@ def bbox_of_mask(mask: np.ndarray, padding: int = 6) -> Optional[tuple]:
     if right <= left or bottom <= top:
         return None
     return (left, top, right, bottom)
+
+
+def dot_pct_of_mask(mask: np.ndarray) -> tuple:
+    """Return the mask centroid as (x_pct, y_pct) — used for FE overlay dots."""
+    ys, xs = np.where(mask > 0)
+    if ys.size == 0:
+        return (50.0, 50.0)
+    h, w = mask.shape
+    return (float(xs.mean()) / w * 100.0, float(ys.mean()) / h * 100.0)
 
 
 def cutout_png(image: Image.Image, mask: np.ndarray, bbox: tuple) -> bytes:
@@ -416,62 +448,69 @@ def filter_in_stock(matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 # ─────────────────────────────────────────────────────────────────────
 
 
-class ProcessRequest(BaseModel):
-    """JSON body for POST /api/process."""
+def _normalize_rle_counts(rle: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a JSON-safe copy of an RLE dict (counts as str, size as list)."""
+    counts = rle.get("counts")
+    if isinstance(counts, bytes):
+        counts = counts.decode("utf-8")
+    return {"size": list(rle.get("size") or []), "counts": counts}
 
-    image_url: str
-    # Optional override. When set, skips the Gemini discovery step.
+
+def _resolve_prompts(
+    room_img: Image.Image, override: Optional[List[str]]
+) -> tuple:
+    """Pick SAM3 prompts to use, with Gemini discovery + safe fallback.
+
+    Returns ``(prompts, prompt_source)`` where ``prompt_source`` is one of
+    ``"caller"`` / ``"gemini"`` / ``"default-empty-discovery"`` /
+    ``"default-error"``.
+    """
+    if override:
+        logger.info(f"Using {len(override)} caller-supplied prompts")
+        return override, "caller"
+    try:
+        discovered = discover_sam3_prompts(room_img)
+    except Exception as e:
+        logger.warning(f"Gemini discovery failed ({e}) — using DEFAULT_PROMPTS")
+        return DEFAULT_PROMPTS, "default-error"
+    if discovered:
+        logger.info(
+            f"Gemini ({GEMINI_MODEL}) discovered {len(discovered)} prompts: "
+            f"{discovered}"
+        )
+        return discovered, "gemini"
+    logger.warning("Gemini returned no usable prompts — using DEFAULT_PROMPTS")
+    return DEFAULT_PROMPTS, "default-empty-discovery"
+
+
+# ───────────────────────── Phase A: detection ─────────────────────────
+
+
+class DetectRequest(BaseModel):
+    """Optional JSON overrides for POST /api/detect."""
+
+    # Override Gemini discovery with a fixed prompt list (used for debugging).
     prompts: Optional[List[str]] = None
 
 
-def process_pipeline(
-    image_url: str, override_prompts: Optional[List[str]] = None
+def detect_objects(
+    room_img: Image.Image, override_prompts: Optional[List[str]] = None
 ) -> Dict[str, Any]:
-    """Run the full discovery → segment → upload → lens → filter pipeline."""
-    logger.info(f"Downloading room: {image_url}")
-    room_img = download_image(image_url)
-    w, h = room_img.size
+    """Gemini → SAM3 → return one entry per detected object.
 
-    # Step 0: Gemini Flash Lite enumerates visible objects as SAM3 prompts.
-    # If the caller forced a prompt list we use that as-is. Otherwise we ask
-    # Gemini; on any failure we fall back to the hardcoded DEFAULT_PROMPTS so
-    # the pipeline still runs.
-    prompts: List[str]
-    prompt_source: str
-    if override_prompts:
-        prompts = override_prompts
-        prompt_source = "caller"
-        logger.info(f"Using {len(prompts)} caller-supplied prompts")
-    else:
-        try:
-            discovered = discover_sam3_prompts(room_img)
-            if discovered:
-                prompts = discovered
-                prompt_source = "gemini"
-                logger.info(
-                    f"Gemini ({GEMINI_MODEL}) discovered {len(prompts)} prompts: "
-                    f"{prompts}"
-                )
-            else:
-                prompts = DEFAULT_PROMPTS
-                prompt_source = "default-empty-discovery"
-                logger.warning(
-                    "Gemini returned no usable prompts — using DEFAULT_PROMPTS"
-                )
-        except Exception as e:
-            prompts = DEFAULT_PROMPTS
-            prompt_source = "default-error"
-            logger.warning(f"Gemini discovery failed ({e}) — using DEFAULT_PROMPTS")
+    Each ``object`` carries the raw RLE mask, its pixel bbox, a centroid dot
+    (% of image), and SAM3's confidence. No cropping or R2 upload at this
+    phase — that happens during search.
+    """
+    h, w = room_img.height, room_img.width
+    prompts, prompt_source = _resolve_prompts(room_img, override_prompts)
 
     image_b64 = encode_jpeg_b64(room_img)
     logger.info(f"SAM3: {len(prompts)} prompts")
-    prompt_results = call_sam3(image_b64, prompts)
+    sam_results = call_sam3(image_b64, prompts)
 
-    # Step 1: per-prompt detection → mask → cutout PNG → upload to R2
-    objects = []  # accumulates per-detected-object dicts
-    masked_urls = []  # the URLs to fan out to Lens
-
-    for label, result in zip(prompts, prompt_results):
+    objects: List[Dict[str, Any]] = []
+    for label, result in zip(prompts, sam_results):
         rle = result.get("rle") or (
             result.get("annotations", [{}])[0].get("rle")
             if result.get("annotations")
@@ -485,42 +524,91 @@ def process_pipeline(
         bbox = bbox_of_mask(mask)
         if bbox is None:
             continue
-        png = cutout_png(room_img, mask, bbox)
+        dot_x_pct, dot_y_pct = dot_pct_of_mask(mask)
+        objects.append(
+            {
+                "id": f"obj_{len(objects) + 1}",
+                "label": label,
+                "confidence": result.get("score"),
+                "mask_rle": _normalize_rle_counts(rle),
+                "bbox": list(bbox),  # [left, top, right, bottom] in pixels
+                "dot": [dot_x_pct, dot_y_pct],  # centroid in % of image
+            }
+        )
+        logger.info(
+            f"  → '{label}' bbox={bbox} dot=({dot_x_pct:.1f}%, {dot_y_pct:.1f}%)"
+        )
+
+    return {
+        "prompt_source": prompt_source,
+        "prompts_used": prompts,
+        "objects": objects,
+    }
+
+
+# ───────────────────────── Phase B: search ─────────────────────────
+
+
+class DetectedObjectIn(BaseModel):
+    """One detected object echoed back from the FE."""
+
+    id: str
+    label: str
+    confidence: Optional[float] = None
+    mask_rle: Dict[str, Any]
+    bbox: List[int]
+    dot: List[float]
+
+
+class SearchRequest(BaseModel):
+    """JSON body for POST /api/search."""
+
+    room_image_url: str
+    objects: List[DetectedObjectIn]
+
+
+def search_for_objects(
+    room_img: Image.Image, objects: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Crop + R2 upload + Lens + filter per detected object."""
+    h, w = room_img.height, room_img.width
+    results: List[Dict[str, Any]] = []
+    masked_urls: List[str] = []
+
+    for obj in objects:
+        mask = rle_to_mask(obj.get("mask_rle") or {}, h, w)
+        if mask is None or mask.max() == 0:
+            logger.warning(f"  → '{obj.get('label')}' mask empty; skipping")
+            continue
+        bbox = tuple(obj.get("bbox") or []) or bbox_of_mask(mask)
+        if not bbox:
+            continue
+        png = cutout_png(room_img, mask, tuple(bbox))
         key = f"test-project/cutouts/{uuid.uuid4().hex}.png"
         try:
             url = upload_png_to_r2(png, key)
         except Exception as e:
-            logger.warning(f"R2 upload failed for {label}: {e}")
+            logger.warning(f"R2 upload failed for {obj.get('label')}: {e}")
             continue
-        score = result.get("score")
-        objects.append(
+        results.append(
             {
-                "label": label,
+                **obj,
                 "masked_image_url": url,
-                "confidence": score,
-                "candidates": [],  # filled below
+                "candidates": [],
+                "raw_match_count": 0,
             }
         )
         masked_urls.append(url)
-        logger.info(f"  → '{label}' uploaded: {url}")
+        logger.info(f"  → '{obj.get('label')}' uploaded: {url}")
 
-    # Step 2: fan out Lens calls in parallel
-    if objects:
+    if masked_urls:
         with ThreadPoolExecutor(max_workers=LENS_MAX_PARALLEL) as pool:
             lens_results = list(pool.map(call_google_lens, masked_urls))
-        for obj, raw_matches in zip(objects, lens_results):
+        for obj, raw_matches in zip(results, lens_results):
             obj["candidates"] = filter_in_stock(raw_matches)
             obj["raw_match_count"] = len(raw_matches)
 
-    summary = {
-        "image_url": image_url,
-        "prompt_source": prompt_source,  # "gemini" | "caller" | "default-*"
-        "prompts_used": prompts,
-        "objects_detected": len(objects),
-        "total_purchasable_candidates": sum(len(o["candidates"]) for o in objects),
-    }
-    logger.info(f"Done: {summary}")
-    return {"summary": summary, "objects": objects}
+    return results
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -544,22 +632,93 @@ app.add_middleware(
 )
 
 
-@app.post("/api/process")
-async def process_endpoint(body: ProcessRequest) -> Dict[str, Any]:
-    """Run the discovery → segment → upload → lens → filter pipeline."""
+def _pipeline_error_to_http(e: Exception) -> HTTPException:
+    """Map pipeline exceptions to clean HTTPExceptions for the endpoints."""
+    if isinstance(e, RuntimeError):
+        return HTTPException(status_code=400, detail=str(e))
+    if isinstance(e, requests.HTTPError):
+        return HTTPException(status_code=502, detail=f"upstream HTTP error: {e}")
+    return HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/detect")
+async def detect_endpoint(
+    room_image: UploadFile = File(...),
+    prompts: Optional[str] = Form(None),
+) -> Dict[str, Any]:
+    """Upload a room image, run Gemini → SAM3, return detected objects.
+
+    The original room is also uploaded to R2 so the search phase can fetch
+    it back without the FE having to re-send the binary.
+
+    Form fields:
+      - ``room_image``: the uploaded photo (required).
+      - ``prompts``: optional JSON-encoded list of strings — if set, skips
+        the Gemini discovery and forces SAM3 to use exactly these prompts.
+
+    Returns:
+      ``{ room_image_url, image_width, image_height, prompt_source,
+          prompts_used, objects: [{ id, label, confidence, mask_rle,
+                                    bbox, dot }] }``
+    """
+    raw = await room_image.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="empty upload")
     try:
-        return await asyncio.to_thread(
-            process_pipeline, body.image_url, body.prompts
-        )
-    except RuntimeError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-    except requests.HTTPError as e:
-        raise HTTPException(
-            status_code=502, detail=f"upstream HTTP error: {e}"
-        ) from e
+        pil_img = Image.open(io.BytesIO(raw))
+        if pil_img.mode != "RGB":
+            pil_img = pil_img.convert("RGB")
     except Exception as e:
-        logger.exception("pipeline failed")
-        raise HTTPException(status_code=500, detail=str(e)) from e
+        raise HTTPException(
+            status_code=400, detail=f"could not decode image: {e}"
+        ) from e
+
+    override_prompts: Optional[List[str]] = None
+    if prompts:
+        try:
+            parsed = json.loads(prompts)
+            if isinstance(parsed, list):
+                override_prompts = [str(p).strip() for p in parsed if str(p).strip()]
+        except Exception:
+            logger.warning(f"ignored unparsable prompts form-field: {prompts!r}")
+
+    try:
+        room_url = await asyncio.to_thread(
+            upload_room_to_r2, raw, room_image.filename or "room.jpg"
+        )
+        detection = await asyncio.to_thread(detect_objects, pil_img, override_prompts)
+    except Exception as e:
+        logger.exception("detect failed")
+        raise _pipeline_error_to_http(e) from e
+
+    return {
+        "room_image_url": room_url,
+        "image_width": pil_img.width,
+        "image_height": pil_img.height,
+        **detection,
+    }
+
+
+@app.post("/api/search")
+async def search_endpoint(body: SearchRequest) -> Dict[str, Any]:
+    """Given the detection result, crop + R2 + Lens + filter per object."""
+    try:
+        pil_img = await asyncio.to_thread(download_image, body.room_image_url)
+        objects = await asyncio.to_thread(
+            search_for_objects,
+            pil_img,
+            [o.dict() for o in body.objects],
+        )
+    except Exception as e:
+        logger.exception("search failed")
+        raise _pipeline_error_to_http(e) from e
+
+    return {
+        "room_image_url": body.room_image_url,
+        "objects_returned": len(objects),
+        "total_purchasable_candidates": sum(len(o["candidates"]) for o in objects),
+        "objects": objects,
+    }
 
 
 @app.get("/api/health")
