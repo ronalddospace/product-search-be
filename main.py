@@ -511,32 +511,61 @@ def detect_objects(
 
     objects: List[Dict[str, Any]] = []
     for label, result in zip(prompts, sam_results):
-        rle = result.get("rle") or (
-            result.get("annotations", [{}])[0].get("rle")
-            if result.get("annotations")
-            else None
+        # Roboflow concept_segment response shape:
+        #   prompt_results[i] = {
+        #     "predictions": [
+        #       { "masks": {size, counts}, "confidence": float, ... },
+        #       ...
+        #     ]
+        #   }
+        # Per prompt we pick the highest-confidence prediction whose mask is
+        # non-empty (mirrors production sam3.py behaviour).
+        predictions = result.get("predictions") or []
+        if not predictions:
+            logger.info(f"  → '{label}' SAM3 returned no predictions")
+            continue
+        # Sort by confidence (desc) and accept the first usable one.
+        predictions = sorted(
+            predictions,
+            key=lambda p: float(p.get("confidence", 0.0)),
+            reverse=True,
         )
-        if not rle:
+        chosen_rle = None
+        chosen_conf = None
+        for pred in predictions:
+            rle = pred.get("masks") or pred.get("rle")
+            if not rle:
+                continue
+            mask = rle_to_mask(rle, h, w)
+            if mask is None or mask.max() == 0:
+                continue
+            chosen_rle = rle
+            chosen_mask = mask
+            chosen_conf = float(pred.get("confidence", 0.0))
+            break
+        if chosen_rle is None:
+            logger.info(
+                f"  → '{label}' all predictions empty "
+                f"(top conf={float(predictions[0].get('confidence', 0)):.2f})"
+            )
             continue
-        mask = rle_to_mask(rle, h, w)
-        if mask is None or mask.max() == 0:
-            continue
-        bbox = bbox_of_mask(mask)
+        bbox = bbox_of_mask(chosen_mask)
         if bbox is None:
             continue
-        dot_x_pct, dot_y_pct = dot_pct_of_mask(mask)
+        dot_x_pct, dot_y_pct = dot_pct_of_mask(chosen_mask)
         objects.append(
             {
                 "id": f"obj_{len(objects) + 1}",
                 "label": label,
-                "confidence": result.get("score"),
-                "mask_rle": _normalize_rle_counts(rle),
+                "confidence": chosen_conf,
+                "mask_rle": _normalize_rle_counts(chosen_rle),
                 "bbox": list(bbox),  # [left, top, right, bottom] in pixels
                 "dot": [dot_x_pct, dot_y_pct],  # centroid in % of image
             }
         )
         logger.info(
-            f"  → '{label}' bbox={bbox} dot=({dot_x_pct:.1f}%, {dot_y_pct:.1f}%)"
+            f"  → '{label}' conf={chosen_conf:.2f} bbox={bbox} "
+            f"dot=({dot_x_pct:.1f}%, {dot_y_pct:.1f}%)"
         )
 
     return {
