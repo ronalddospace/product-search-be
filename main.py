@@ -71,28 +71,24 @@ R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
 R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "")
 R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL", "").rstrip("/")
 
-# The set of object types SAM3 looks for. Edit freely — each prompt gives at
-# most one detection per image; cheap/safe to add more.
+# Fallback object types — used only when Gemini discovery fails (e.g.
+# quota exceeded). Kept at <= ``GEMINI_MAX_OBJECTS`` items so the SAM3 call
+# stays inside Roboflow's 16-prompt cap. Tuned to cover the most common
+# living-room / bedroom items; extend if you regularly process other
+# room types.
 DEFAULT_PROMPTS = [
     "sofa",
     "armchair",
     "chair",
     "coffee table",
     "side table",
-    "dining table",
     "floor lamp",
-    "table lamp",
     "rug",
     "artwork",
     "plant",
-    "vase",
-    "bookshelf",
-    "cabinet",
     "tv",
     "bed",
-    "pillow",
-    "curtain",
-    "mirror",
+    "bookshelf",
 ]
 
 # Lens config
@@ -127,6 +123,13 @@ def _gemini_get_client():
     return _gemini_client
 
 
+# Max items Gemini is asked to return. Caps two things at once:
+#   - cost / latency of the downstream SAM3 + Lens fan-out;
+#   - Roboflow's per-call cap of 16 prompts (we stay safely below).
+# Production tuning: bump if you want more recall, lower for faster runs.
+GEMINI_MAX_OBJECTS = 12
+
+
 # Instruction we send to Gemini. The model returns a JSON array where each
 # entry has BOTH a bare ``object_type`` (the category word — used as the
 # Google Lens text query) and a richer ``sam3_prompt`` (colour + material +
@@ -134,9 +137,12 @@ def _gemini_get_client():
 # anchor Lens to the right product category (so a side-profile TV doesn't
 # come back as combs/pianos) while still giving SAM3 the colour cue it needs
 # to find the right pixels.
-DISCOVERY_INSTRUCTION = """\
-You are looking at a photo of a room. List every distinct piece of furniture
-and decor visible.
+DISCOVERY_INSTRUCTION = f"""\
+You are looking at a photo of a room. List the most visually prominent
+furniture and decor pieces — at MOST {GEMINI_MAX_OBJECTS} items, ranked by
+size and visual prominence. If there are more than {GEMINI_MAX_OBJECTS}
+distinct items in the room, keep the {GEMINI_MAX_OBJECTS} that dominate
+the frame and drop the rest.
 
 For each item, output TWO fields:
 
@@ -152,6 +158,7 @@ For each item, output TWO fields:
                                "black flat-screen tv".
 
 Rules:
+  - Hard limit: at most {GEMINI_MAX_OBJECTS} items in the output array.
   - Colour FIRST in ``sam3_prompt`` — SAM3 matches colour most reliably.
   - ``object_type`` is the SAME category word that ends the ``sam3_prompt``.
   - Skip walls, floor, and ceiling — handled separately.
@@ -161,9 +168,9 @@ Rules:
 
 Example output:
 [
-  {"object_type": "sofa",         "sam3_prompt": "gray linen sofa"},
-  {"object_type": "coffee table", "sam3_prompt": "round oak coffee table"},
-  {"object_type": "floor lamp",   "sam3_prompt": "tall brass floor lamp"}
+  {{"object_type": "sofa",         "sam3_prompt": "gray linen sofa"}},
+  {{"object_type": "coffee table", "sam3_prompt": "round oak coffee table"}},
+  {{"object_type": "floor lamp",   "sam3_prompt": "tall brass floor lamp"}}
 ]
 """
 
@@ -228,6 +235,10 @@ def discover_objects_via_gemini(
     """Ask Gemini Flash Lite to enumerate visible objects.
 
     Returns one dict per object: ``{"object_type": str, "sam3_prompt": str}``.
+    The result is hard-capped at ``GEMINI_MAX_OBJECTS`` entries — Gemini is
+    already instructed to stay under this cap, but we slice defensively in
+    case the model returns more (keeping the first N, which the prompt asks
+    it to order by visual prominence).
     Returns an empty list if Gemini cannot produce a usable response
     (caller falls back to ``DEFAULT_PROMPTS``).
     """
@@ -248,7 +259,14 @@ def discover_objects_via_gemini(
         return []
     parts = candidates[0].content.parts if candidates[0].content else []
     text = "\n".join(p.text for p in parts if getattr(p, "text", None))
-    return _parse_prompt_list(text)
+    parsed = _parse_prompt_list(text)
+    if len(parsed) > GEMINI_MAX_OBJECTS:
+        logger.info(
+            f"Gemini returned {len(parsed)} items; trimming to "
+            f"{GEMINI_MAX_OBJECTS} most prominent"
+        )
+        parsed = parsed[:GEMINI_MAX_OBJECTS]
+    return parsed
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -393,15 +411,16 @@ def cutout_png(image: Image.Image, mask: np.ndarray, bbox: tuple) -> bytes:
 # Roboflow SAM3 — concept_segment
 # ─────────────────────────────────────────────────────────────────────
 
+# Roboflow caps each concept_segment call at 16 text prompts. Chunk above
+# this size and fan out in parallel — order is preserved when results are
+# stitched back together.
+SAM3_MAX_PROMPT_BATCH_SIZE = 16
 
-def call_sam3(image_b64: str, prompts: List[str]) -> List[Dict[str, Any]]:
-    """POST to Roboflow's SAM3 ``concept_segment`` endpoint.
 
-    Returns a list of ``prompt_results``: one entry per prompt, in input order.
-    Each entry has either ``rle`` + ``score`` or is empty.
-    """
-    if not ROBOFLOW_API_KEY:
-        raise RuntimeError("ROBOFLOW_API_KEY missing in .env")
+def _call_sam3_batch(
+    image_b64: str, prompts: List[str]
+) -> List[Dict[str, Any]]:
+    """POST one ≤16-prompt batch to Roboflow's SAM3 endpoint."""
     payload = {
         "image": {"type": "base64", "value": image_b64},
         "prompts": [{"type": "text", "text": p} for p in prompts],
@@ -418,6 +437,41 @@ def call_sam3(image_b64: str, prompts: List[str]) -> List[Dict[str, Any]]:
             f"Roboflow SAM3 returned {resp.status_code}: {resp.text[:300]}"
         )
     return resp.json().get("prompt_results", []) or []
+
+
+def call_sam3(image_b64: str, prompts: List[str]) -> List[Dict[str, Any]]:
+    """Run Roboflow SAM3 concept_segment, chunking above the 16-prompt cap.
+
+    Returns ``prompt_results`` aligned to the input ``prompts`` list (one
+    entry per input prompt, in order). When more than
+    ``SAM3_MAX_PROMPT_BATCH_SIZE`` prompts are supplied, the call is split
+    into parallel batches via ``ThreadPoolExecutor`` and the per-batch
+    responses are concatenated.
+    """
+    if not ROBOFLOW_API_KEY:
+        raise RuntimeError("ROBOFLOW_API_KEY missing in .env")
+    if not prompts:
+        return []
+
+    if len(prompts) <= SAM3_MAX_PROMPT_BATCH_SIZE:
+        return _call_sam3_batch(image_b64, prompts)
+
+    batches = [
+        prompts[i : i + SAM3_MAX_PROMPT_BATCH_SIZE]
+        for i in range(0, len(prompts), SAM3_MAX_PROMPT_BATCH_SIZE)
+    ]
+    logger.info(
+        f"SAM3: chunking {len(prompts)} prompts into {len(batches)} "
+        f"parallel batches (cap={SAM3_MAX_PROMPT_BATCH_SIZE})"
+    )
+    with ThreadPoolExecutor(max_workers=len(batches)) as pool:
+        per_batch_results = list(
+            pool.map(lambda b: _call_sam3_batch(image_b64, b), batches)
+        )
+    out: List[Dict[str, Any]] = []
+    for results in per_batch_results:
+        out.extend(results)
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────
