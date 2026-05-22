@@ -252,7 +252,7 @@ def upload_room_to_r2(image_bytes: bytes, filename: str) -> str:
         ".png": "image/png",
         ".webp": "image/webp",
     }[ext]
-    key = f"test-project/rooms/{uuid.uuid4().hex}{ext}"
+    key = f"poc-room/room_{uuid.uuid4().hex}{ext}"
     client = _r2_client()
     client.put_object(
         Bucket=R2_BUCKET_NAME,
@@ -584,7 +584,7 @@ def search_for_objects(
         if not bbox:
             continue
         png = cutout_png(room_img, mask, tuple(bbox))
-        key = f"test-project/cutouts/{uuid.uuid4().hex}.png"
+        key = f"poc-object/{uuid.uuid4().hex}.png"
         try:
             url = upload_png_to_r2(png, key)
         except Exception as e:
