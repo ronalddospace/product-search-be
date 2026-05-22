@@ -734,6 +734,18 @@ def health() -> Dict[str, str]:
     }
 
 
-# Serve the frontend at "/" — has to be mounted last so /api/* still routes.
+# Serve the frontend at "/" — only when running locally as a sibling of the
+# backend directory. In production (e.g. Railway), the backend repo is the
+# deploy root and there is no neighbouring ``frontend/`` folder; trying to
+# mount a missing path would crash uvicorn at import time.
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
-app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
+if FRONTEND_DIR.is_dir():
+    app.mount(
+        "/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend"
+    )
+    logger.info(f"Mounted static frontend at / from {FRONTEND_DIR}")
+else:
+    logger.info(
+        f"No sibling frontend/ at {FRONTEND_DIR} — running API-only "
+        f"(set BACKEND_URL on the FE deploy to this service's URL)"
+    )
