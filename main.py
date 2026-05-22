@@ -2,17 +2,22 @@
 
 POST /api/process — full pipeline:
   1. Download the room image.
-  2. Roboflow SAM3 ``concept_segment`` with a fixed list of furniture prompts.
-  3. For each detected object: crop to bbox + apply mask as alpha → transparent
+  2. Vision LLM (OpenAI or Gemini, picked via VISION_PROVIDER) emits a
+     SAM3-ready prompt list by looking at the room.
+  3. Roboflow SAM3 ``concept_segment`` against those prompts.
+  4. For each detected object: crop to bbox + apply mask as alpha → transparent
      PNG → upload to R2 → get a public URL.
-  4. Run SearchAPI.io Google Lens (search_type=products) against each public URL
+  5. Run SearchAPI.io Google Lens (search_type=products) against each public URL
      in parallel.
-  5. Keep only candidates that look genuinely purchasable
+  6. Keep only candidates that look genuinely purchasable
      (has a price AND is not flagged out-of-stock).
 
 GET / — serves the frontend (../frontend/index.html and friends).
 
 Env vars required — copy .env.example to .env and fill in:
+  VISION_PROVIDER (openai|gemini)
+  OPENAI_API_KEY  (when VISION_PROVIDER=openai)
+  GOOGLE_API_KEY  (when VISION_PROVIDER=gemini)
   ROBOFLOW_API_KEY
   SEARCH_API_KEY
   R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY,
@@ -71,42 +76,33 @@ R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
 R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "")
 R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL", "").rstrip("/")
 
-# Fallback object types — used only when Gemini discovery fails (e.g.
-# quota exceeded). Kept at <= ``GEMINI_MAX_OBJECTS`` items so the SAM3 call
-# stays inside Roboflow's 16-prompt cap. Tuned to cover the most common
-# living-room / bedroom items; extend if you regularly process other
-# room types.
-DEFAULT_PROMPTS = [
-    "sofa",
-    "armchair",
-    "chair",
-    "coffee table",
-    "side table",
-    "floor lamp",
-    "rug",
-    "artwork",
-    "plant",
-    "tv",
-    "bed",
-    "bookshelf",
-]
-
 # Lens config
 LENS_COUNTRY = os.environ.get("LENS_COUNTRY", "us")
 LENS_LANGUAGE = os.environ.get("LENS_LANGUAGE", "en")
-LENS_MAX_PARALLEL = int(os.environ.get("LENS_MAX_PARALLEL", "6"))
+LENS_MAX_PARALLEL = int(os.environ.get("LENS_MAX_PARALLEL", "12"))
 
-# Gemini — vision LLM that emits SAM3-ready prompts by looking at the room.
+# Vision LLM — picks the provider that looks at the room image and emits
+# SAM3-ready prompts. "openai" or "gemini".
+VISION_PROVIDER = os.environ.get("VISION_PROVIDER", "openai").strip().lower()
+
+# Gemini config
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
 
+# OpenAI config
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+
 
 # ─────────────────────────────────────────────────────────────────────
-# Gemini client (lazy, thread-safe)
+# Vision LLM clients (lazy, thread-safe) — Gemini + OpenAI
 # ─────────────────────────────────────────────────────────────────────
 
 _gemini_client = None
 _gemini_client_lock = threading.Lock()
+
+_openai_client = None
+_openai_client_lock = threading.Lock()
 
 
 def _gemini_get_client():
@@ -123,15 +119,29 @@ def _gemini_get_client():
     return _gemini_client
 
 
-# Max items Gemini is asked to return. Caps two things at once:
+def _openai_get_client():
+    """Lazy thread-safe ``openai.OpenAI`` client."""
+    global _openai_client
+    if _openai_client is None:
+        with _openai_client_lock:
+            if _openai_client is None:
+                if not OPENAI_API_KEY:
+                    raise RuntimeError("OPENAI_API_KEY missing in .env")
+                from openai import OpenAI
+
+                _openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    return _openai_client
+
+
+# Max items the vision LLM is asked to return. Caps two things at once:
 #   - cost / latency of the downstream SAM3 + Lens fan-out;
 #   - Roboflow's per-call cap of 16 prompts (we stay safely below).
 # Production tuning: bump if you want more recall, lower for faster runs.
-GEMINI_MAX_OBJECTS = 12
+VISION_MAX_OBJECTS = 12
 
 
-# Instruction we send to Gemini. The model returns a JSON array where each
-# entry has BOTH a bare ``object_type`` (the category word — used as the
+# Instruction we send to the vision LLM. The model returns a JSON array where
+# each entry has BOTH a bare ``object_type`` (the category word — used as the
 # Google Lens text query) and a richer ``sam3_prompt`` (colour + material +
 # category — fed to Roboflow SAM3 for segmentation). Splitting them lets us
 # anchor Lens to the right product category (so a side-profile TV doesn't
@@ -139,9 +149,9 @@ GEMINI_MAX_OBJECTS = 12
 # to find the right pixels.
 DISCOVERY_INSTRUCTION = f"""\
 You are looking at a photo of a room. List the most visually prominent
-furniture and decor pieces — at MOST {GEMINI_MAX_OBJECTS} items, ranked by
-size and visual prominence. If there are more than {GEMINI_MAX_OBJECTS}
-distinct items in the room, keep the {GEMINI_MAX_OBJECTS} that dominate
+furniture and decor pieces — at MOST {VISION_MAX_OBJECTS} items, ranked by
+size and visual prominence. If there are more than {VISION_MAX_OBJECTS}
+distinct items in the room, keep the {VISION_MAX_OBJECTS} that dominate
 the frame and drop the rest.
 
 For each item, output TWO fields:
@@ -158,7 +168,7 @@ For each item, output TWO fields:
                                "black flat-screen tv".
 
 Rules:
-  - Hard limit: at most {GEMINI_MAX_OBJECTS} items in the output array.
+  - Hard limit: at most {VISION_MAX_OBJECTS} items in the output array.
   - Colour FIRST in ``sam3_prompt`` — SAM3 matches colour most reliably.
   - ``object_type`` is the SAME category word that ends the ``sam3_prompt``.
   - Skip walls, floor, and ceiling — handled separately.
@@ -229,19 +239,10 @@ def _parse_prompt_list(text: str) -> List[Dict[str, str]]:
     return out
 
 
-def discover_objects_via_gemini(
+def _discover_via_gemini(
     room_image: Image.Image,
 ) -> List[Dict[str, str]]:
-    """Ask Gemini Flash Lite to enumerate visible objects.
-
-    Returns one dict per object: ``{"object_type": str, "sam3_prompt": str}``.
-    The result is hard-capped at ``GEMINI_MAX_OBJECTS`` entries — Gemini is
-    already instructed to stay under this cap, but we slice defensively in
-    case the model returns more (keeping the first N, which the prompt asks
-    it to order by visual prominence).
-    Returns an empty list if Gemini cannot produce a usable response
-    (caller falls back to ``DEFAULT_PROMPTS``).
-    """
+    """Ask Gemini to enumerate visible objects. Returns parsed prompt list."""
     from google.genai import types
 
     client = _gemini_get_client()
@@ -258,14 +259,74 @@ def discover_objects_via_gemini(
     if not candidates:
         return []
     parts = candidates[0].content.parts if candidates[0].content else []
-    text = "\n".join(p.text for p in parts if getattr(p, "text", None))
-    parsed = _parse_prompt_list(text)
-    if len(parsed) > GEMINI_MAX_OBJECTS:
-        logger.info(
-            f"Gemini returned {len(parsed)} items; trimming to "
-            f"{GEMINI_MAX_OBJECTS} most prominent"
+    return _parse_prompt_list(
+        "\n".join(p.text for p in parts if getattr(p, "text", None))
+    )
+
+
+def _discover_via_openai(
+    room_image: Image.Image,
+) -> List[Dict[str, str]]:
+    """Ask OpenAI (vision chat) to enumerate visible objects.
+
+    The room image is base64-encoded inline as a ``data:`` URL — keeps the
+    call self-contained and avoids needing a public URL just for discovery.
+    """
+    client = _openai_get_client()
+    buf = io.BytesIO()
+    room_image.save(buf, format="JPEG", quality=90)
+    image_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    response = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        temperature=0.0,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": DISCOVERY_INSTRUCTION},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{image_b64}"
+                        },
+                    },
+                ],
+            }
+        ],
+    )
+    choices = getattr(response, "choices", None) or []
+    if not choices:
+        return []
+    text = (choices[0].message.content or "") if choices[0].message else ""
+    return _parse_prompt_list(text)
+
+
+def discover_objects(
+    room_image: Image.Image,
+) -> List[Dict[str, str]]:
+    """Dispatch to the configured vision provider and return prompt items.
+
+    Returns one dict per object: ``{"object_type": str, "sam3_prompt": str}``.
+    The result is hard-capped at ``VISION_MAX_OBJECTS`` entries — the model
+    is already instructed to stay under this cap, but we slice defensively in
+    case it returns more (keeping the first N, which the prompt asks it to
+    order by visual prominence).
+    """
+    if VISION_PROVIDER == "openai":
+        parsed = _discover_via_openai(room_image)
+    elif VISION_PROVIDER == "gemini":
+        parsed = _discover_via_gemini(room_image)
+    else:
+        raise RuntimeError(
+            f"Unknown VISION_PROVIDER={VISION_PROVIDER!r}; "
+            f"expected 'openai' or 'gemini'"
         )
-        parsed = parsed[:GEMINI_MAX_OBJECTS]
+    if len(parsed) > VISION_MAX_OBJECTS:
+        logger.info(
+            f"{VISION_PROVIDER} returned {len(parsed)} items; trimming to "
+            f"{VISION_MAX_OBJECTS} most prominent"
+        )
+        parsed = parsed[:VISION_MAX_OBJECTS]
     return parsed
 
 
@@ -331,12 +392,26 @@ def upload_room_to_r2(image_bytes: bytes, filename: str) -> str:
 
 
 def download_image(url: str) -> Image.Image:
-    """Fetch an image URL into a PIL.Image (RGB)."""
-    resp = requests.get(url, timeout=30)
+    """Fetch an image URL into a fully-decoded PIL.Image (RGB).
+
+    PIL's ``Image.open`` is **lazy** — the decoder isn't actually run until
+    something touches pixel data (e.g. ``.crop()``). That's a problem in
+    ``/api/search`` where multiple worker threads call ``.crop()`` on the
+    same image concurrently: each one races to trigger the deferred decode
+    and PIL's internal state corrupts, producing "image file is truncated"
+    and "unrecognized data stream contents" errors at random.
+
+    Calling ``.load()`` here forces the decode to happen synchronously on the
+    download thread, so worker threads later see a stable, fully-resident
+    image. ``convert("RGB")`` already loads on most paths but is not
+    contractually guaranteed to — the explicit ``.load()`` is the belt.
+    """
+    resp = requests.get(url, timeout=60)
     resp.raise_for_status()
     img = Image.open(io.BytesIO(resp.content))
     if img.mode != "RGB":
         img = img.convert("RGB")
+    img.load()
     return img
 
 
@@ -566,47 +641,31 @@ def _normalize_rle_counts(rle: Dict[str, Any]) -> Dict[str, Any]:
     return {"size": list(rle.get("size") or []), "counts": counts}
 
 
-def _defaults_as_dicts() -> List[Dict[str, str]]:
-    """Turn ``DEFAULT_PROMPTS`` (flat strings) into the dict shape."""
-    out: List[Dict[str, str]] = []
-    for p in DEFAULT_PROMPTS:
-        item = _coerce_prompt_item(p)
-        if item:
-            out.append(item)
-    return out
-
-
 def _resolve_prompts(
     room_img: Image.Image, override: Optional[List[str]]
 ) -> tuple:
-    """Pick the prompt list, with Gemini discovery + safe fallback.
+    """Pick the prompt list from caller override or vision discovery.
 
     Returns ``(items, prompt_source)`` where each ``item`` is
-    ``{"object_type", "sam3_prompt"}`` and ``prompt_source`` is one of
-    ``"caller"`` / ``"gemini"`` / ``"default-empty-discovery"`` /
-    ``"default-error"``.
+    ``{"object_type", "sam3_prompt"}`` and ``prompt_source`` is either
+    ``"caller"`` or the active provider name (``"openai"`` / ``"gemini"``).
+    Raises ``RuntimeError`` if discovery produces no usable prompts —
+    there is no hard-coded fallback.
     """
     if override:
-        # Caller-supplied list is plain strings (debug/manual use); coerce
-        # each entry into the dict shape using the same rule as the
-        # ``DEFAULT_PROMPTS`` fallback.
         items = [_coerce_prompt_item(p) for p in override]
         items = [i for i in items if i is not None]
         logger.info(f"Using {len(items)} caller-supplied prompts")
         return items, "caller"
-    try:
-        discovered = discover_objects_via_gemini(room_img)
-    except Exception as e:
-        logger.warning(f"Gemini discovery failed ({e}) — using DEFAULT_PROMPTS")
-        return _defaults_as_dicts(), "default-error"
-    if discovered:
-        logger.info(
-            f"Gemini ({GEMINI_MODEL}) discovered {len(discovered)} items: "
-            f"{discovered}"
+    discovered = discover_objects(room_img)
+    if not discovered:
+        raise RuntimeError(
+            f"{VISION_PROVIDER} discovery returned no usable prompts"
         )
-        return discovered, "gemini"
-    logger.warning("Gemini returned no usable prompts — using DEFAULT_PROMPTS")
-    return _defaults_as_dicts(), "default-empty-discovery"
+    logger.info(
+        f"{VISION_PROVIDER} discovered {len(discovered)} items: {discovered}"
+    )
+    return discovered, VISION_PROVIDER
 
 
 # ───────────────────────── Phase A: detection ─────────────────────────
@@ -939,8 +998,11 @@ def health() -> Dict[str, str]:
         "roboflow_key": "set" if ROBOFLOW_API_KEY else "missing",
         "search_api_key": "set" if SEARCH_API_KEY else "missing",
         "google_api_key": "set" if GOOGLE_API_KEY else "missing",
+        "openai_key": "set" if OPENAI_API_KEY else "missing",
         "r2": "set" if R2_BUCKET_NAME and R2_PUBLIC_URL else "missing",
+        "vision_provider": VISION_PROVIDER,
         "gemini_model": GEMINI_MODEL,
+        "openai_model": OPENAI_MODEL,
     }
 
 
